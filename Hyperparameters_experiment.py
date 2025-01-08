@@ -1,0 +1,255 @@
+""" Experiment with Malarial cells dataset. Running the pretrained model
+ with the following parameters :
+ model = Resnet18
+Looping over different number of epochs, batch sizes and learning rates
+Using the CNN as fixed feature extractor 
+(freeze the weights, change the last layer)
+ """
+
+# Imports 
+from __future__ import print_function, division
+import sys
+import torch
+import torch.nn as nn
+import torch.optim as optim
+# Learning rate scheduler 
+from torch.optim import lr_scheduler
+import torch.backends.cudnn as cudnn
+import numpy as np
+# for loading data 
+import torchvision
+from torchvision import datasets, models, transforms 
+
+import matplotlib.pyplot as plt
+import time
+import os
+import copy
+
+from itertools import product
+
+cudnn.benchmark = True
+plt.ion() 
+
+
+# Set up Tensorboard 
+
+from torch.utils.tensorboard import SummaryWriter
+
+# default `log_dir` is "runs" - we'll be more specific here
+writer = SummaryWriter('runs/Experiment_hp_tuning')
+
+# Data augmentation and normalization for training
+data_transforms = {
+    'train': transforms.Compose([
+        transforms.RandomResizedCrop(224),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ]),
+    'val': transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ]),
+}
+
+
+data_dir = '/home/golubeka/Trackmodule2/Malarial_cells'
+image_datasets = {x: datasets.ImageFolder(os.path.join(data_dir, x),
+                                          data_transforms[x])
+                  for x in ['train', 'val']}
+# dataloaders = {x: torch.utils.data.DataLoader(image_datasets[x], batch_size=32,
+                                             # shuffle=True, num_workers=4)
+              #for x in ['train', 'val']}
+dataset_sizes = {x: len(image_datasets[x]) for x in ['train', 'val']}
+class_names = image_datasets['train'].classes
+
+device = torch.device("cuda:5" if torch.cuda.is_available() else "cpu")
+
+
+
+def train_model(model, criterion, optimizer, scheduler, num_epochs):
+    since = time.time()
+
+    best_model_wts = copy.deepcopy(model.state_dict())
+    best_acc = 0.0
+
+    for epoch in range(num_epochs):
+        print(f'Epoch {epoch}/{num_epochs - 1}')
+        print('-' * 10)
+
+        # Each epoch has a training and validation phase
+        for phase in ['train', 'val']:
+            if phase == 'train':
+                model.train()  # Set model to training mode
+                
+                running_loss = 0.0
+                running_corrects = 0
+
+                for i, (inputs, labels) in enumerate(dataloaders['train']):
+                    inputs = inputs.to(device)
+                    labels = labels.to(device)
+
+                    # zero the parameter gradients
+                    optimizer.zero_grad()
+
+                    # forward
+                    # track history if only in train
+                    with torch.set_grad_enabled(phase == 'train'):
+                        outputs = model(inputs)
+                        _, preds = torch.max(outputs, 1)
+                        loss = criterion(outputs, labels)
+
+                        # backward + optimize only if in training phase
+                        if phase == 'train':
+                            loss.backward()
+                            optimizer.step()
+
+                    # statistics
+                    running_loss += loss.item() * inputs.size(0)
+                    running_corrects += torch.sum(preds == labels.data)
+
+                # scheduler.step()
+
+                epoch_loss = running_loss / dataset_sizes[phase]
+                epoch_acc = running_corrects.double() / dataset_sizes[phase]
+
+                scheduler.step(epoch_loss)
+
+                print(f'{phase} Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}')
+                writer.add_scalar('training loss', epoch_loss, epoch)
+                writer.add_scalar('train Accuracy', epoch_acc, epoch)
+
+            else: # evaluation loop
+                model.eval()   # Set model to evaluate mode
+
+                running_loss = 0.0
+                running_corrects = 0
+
+                # Iterate over data.
+                for i, (inputs, labels) in enumerate(dataloaders['val']):
+                    inputs = inputs.to(device)
+                    labels = labels.to(device)
+
+                    # zero the parameter gradients
+                    # optimizer.zero_grad()
+
+                    outputs = model(inputs)
+                    _, preds = torch.max(outputs, 1)
+                    loss = criterion(outputs, labels)
+
+                    # statistics
+                    running_loss += loss.item() * inputs.size(0)
+                    running_corrects += torch.sum(preds == labels.data)
+               
+                epoch_loss = running_loss / dataset_sizes[phase]
+                epoch_acc = running_corrects.double() / dataset_sizes[phase]
+
+                print(f'{phase} Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}')
+                writer.add_scalar('validation loss', epoch_loss, epoch)
+                writer.add_scalar('val. Accuracy', epoch_acc, epoch)
+            #writer.add_figure('predictions vs. actuals',visualize_model(model,num_images=6),global_step=epoch * len(dataloaders['train']) + i)
+
+                # deep copy the model
+                if  epoch_acc > best_acc:
+                    best_acc = epoch_acc
+                    best_model_wts = copy.deepcopy(model.state_dict())
+
+
+    time_elapsed = time.time() - since
+    print(f'Training complete in {time_elapsed // 60:.0f}m {time_elapsed % 60:.0f}s')
+    print(f'Best val Acc: {best_acc:4f}')
+
+    # load best model weights
+    model.load_state_dict(best_model_wts)
+    return model
+
+
+""" ConvNet as fixed feature extractor
+Here, we need to freeze all the network except the final layer. 
+We need to set requires_grad = False to freeze the parameters so that the gradients 
+are not computed in backward().
+
+ """
+
+model_conv = torchvision.models.resnet18(pretrained=True)
+for param in model_conv.parameters():
+    param.requires_grad = False
+
+# Parameters of newly constructed modules have requires_grad=True by default
+num_ftrs = model_conv.fc.in_features
+model_conv.fc = nn.Linear(num_ftrs, 2)
+
+model_conv = model_conv.to(device)
+
+criterion = nn.CrossEntropyLoss()
+
+# Observe that only parameters of final layer are being optimized as
+# opposed to before.
+optimizer_conv = optim.SGD(model_conv.fc.parameters(), lr=0.001, momentum=0.9)
+
+# Decay LR by a factor of 0.1 every 7 epochs
+# scheduler = lr_scheduler.StepLR(optimizer_conv, step_size=7, gamma=0.1)
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer_conv, factor = 0.1, patience = 5, verbose = True)
+#scheduler = optim.lr_scheduler.ExponentialLR(optimizer_conv, gamma = 0.1, last_epoch= -1, verbose= True)
+# scheduler = optim.lr_scheduler.LinearLR(optimizer_conv, start_factor=0.3333333333333333, end_factor=1.0, total_iters=5, last_epoch=- 1, verbose=True)
+# scheduler = optim.lr_scheduler.ConstantLR(optimizer_conv, factor=0.3333333333333333, total_iters=5, last_epoch=- 1, verbose= True)
+# scheduler = optim.lr_scheduler.MultiStepLR(optimizer_conv, milestones = [1,4,8,12] , gamma=0.1, last_epoch=- 1, verbose=True)
+
+""" Train and evaluate
+On CPU this will take about half the time compared to previous scenario. 
+This is expected as gradients don’t need to be computed for most of the network. 
+However, forward does need to be computed. """
+
+parameters = dict(
+    lr = [0.01, 0.001],
+    batch_size = [32,64],
+    num_epochs = [15, 20, 30]
+)
+param_values = [v for v in parameters.values()]
+
+# Training Loop
+for run_id, (lr,batch_size, num_epochs) in enumerate(product(*param_values)):
+    print("run id:", run_id + 1)
+    dataloaders = {x: torch.utils.data.DataLoader(image_datasets[x], batch_size=batch_size,
+                                             shuffle=True, num_workers=4)
+              for x in ['train', 'val']}
+    train_loader = dataloaders['train']
+    optimizer = optim.SGD(model_conv.fc.parameters(), lr=lr, momentum=0.9)
+    criterion = nn.CrossEntropyLoss()
+    comment = f' batch_size = {batch_size} lr = {lr} num_epochs = {num_epochs}'
+    tb = SummaryWriter(comment=comment)
+
+
+    model_conv = train_model(model_conv, criterion, optimizer, scheduler, num_epochs=num_epochs)
+
+""" already done in the training def 
+    tb.add_scalar("Loss", epoch_loss, epoch)
+    tb.add_scalar("Correct", total_correct, epoch)
+    tb.add_scalar("Accuracy", total_correct/ len(train_loader), epoch) """
+
+    print("batch_size:",batch_size, "lr:",lr,"num_epochs:", num_epochs)
+    print("epoch:", epoch, "total_correct:", epoch_acc, "loss:",epoch_loss)
+    print("___________________________________________________________________")
+
+    tb.add_hparams(
+            {"lr": lr, "bsize": batch_size, "num_epochs": num_epochs},
+            {
+                "accuracy": epoch_acc,
+                "loss": epoch_loss,
+            },
+        )
+
+tb.close()
+
+
+#visualize_model(model_conv)
+
+plt.ioff()
+#plt.show() 
+
+# Tensorboard 
+""" writer.add_graph(model_conv,inputs)
+writer.close()
+ """
